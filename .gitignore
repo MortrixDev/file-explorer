@@ -1,0 +1,14 @@
+*
+!*/
+
+/target/
+
+!/.gitignore
+!/Cargo.toml
+!/Cargo.lock
+!/flake.nix
+!/flake.lock
+!/package.nix
+!/src/**/*.rs
+!/shells/**
+!/tests/**/*.rs
