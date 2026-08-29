@@ -96,7 +96,9 @@ fn sync_image(
     area: Rect,
 ) {
     let want = match (&state.right, &state.right_of) {
-        (Content::File(Preview::Image { .. }), Some(path)) if state.graphics && !state.busy() => {
+        (Content::File(Preview::Image { .. } | Preview::Pdf { .. }), Some(path))
+            if state.graphics && !state.busy() =>
+        {
             Some((path.clone(), area))
         }
         _ => None,

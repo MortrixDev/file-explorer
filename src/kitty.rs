@@ -1,12 +1,18 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{self, Write};
-use std::path::PathBuf;
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 
 use base64::Engine;
 
+use hayro::hayro_interpret::InterpreterSettings;
+use hayro::hayro_syntax::Pdf;
+use hayro::vello_cpu::color::palette::css::WHITE;
+use hayro::{RenderCache, RenderSettings, render as render_page};
+
+const MIN_SCALE: f32 = 0.01;
 const CHUNK: usize = 4096;
 const ID: u32 = 1;
 const CACHE: usize = 32;
@@ -117,7 +123,7 @@ impl Default for Loader {
 
 fn render(key: &Key) -> io::Result<Image> {
     let (path, max_w, max_h) = key;
-    let image = image::open(path).map_err(io::Error::other)?;
+    let image = source(path, *max_w, *max_h)?;
     let image = fit(image, *max_w, *max_h);
 
     let mut png = io::Cursor::new(Vec::new());
@@ -127,6 +133,56 @@ fn render(key: &Key) -> io::Result<Image> {
     Ok(Image {
         png: png.into_inner(),
     })
+}
+
+fn source(path: &Path, max_w: u32, max_h: u32) -> io::Result<image::DynamicImage> {
+    if !is_pdf(path) {
+        return image::open(path).map_err(io::Error::other);
+    }
+    let data = std::fs::read(path)?;
+    std::panic::catch_unwind(|| rasterize(data, max_w, max_h))
+        .unwrap_or_else(|_| Err(io::Error::other("pdf: renderer failed")))
+}
+
+fn is_pdf(path: &Path) -> bool {
+    let mut head = [0u8; 5];
+    match std::fs::File::open(path).and_then(|mut file| file.read(&mut head)) {
+        Ok(5) => &head == b"%PDF-",
+        _ => false,
+    }
+}
+
+fn rasterize(data: Vec<u8>, max_w: u32, max_h: u32) -> io::Result<image::DynamicImage> {
+    let pdf = Pdf::new(data).map_err(|e| io::Error::other(format!("pdf: {e:?}")))?;
+    let pages = pdf.pages();
+    let page = pages
+        .iter()
+        .next()
+        .ok_or_else(|| io::Error::other("pdf: no pages"))?;
+
+    let (w, h) = page.render_dimensions();
+    if w <= 0.0 || h <= 0.0 {
+        return Err(io::Error::other("pdf: empty page"));
+    }
+    let scale = (max_w as f32 / w).min(max_h as f32 / h).max(MIN_SCALE);
+
+    let settings = RenderSettings {
+        x_scale: scale,
+        y_scale: scale,
+        bg_color: WHITE,
+        ..Default::default()
+    };
+    let pixmap = render_page(
+        page,
+        &RenderCache::new(),
+        &InterpreterSettings::default(),
+        &settings,
+    );
+
+    let (pw, ph) = (pixmap.width() as u32, pixmap.height() as u32);
+    image::RgbaImage::from_raw(pw, ph, pixmap.data_as_u8_slice().to_vec())
+        .map(image::DynamicImage::ImageRgba8)
+        .ok_or_else(|| io::Error::other("pdf: bad pixmap"))
 }
 
 fn fit(image: image::DynamicImage, max_w: u32, max_h: u32) -> image::DynamicImage {

@@ -104,7 +104,12 @@ impl State {
     pub fn toggle_hidden(&mut self) {
         self.filter.show_hidden = !self.filter.show_hidden;
         self.left.refilter(&self.filter);
-        self.right_of = None;
+
+        if let (Content::Dir(_), Some(path)) = (&self.right, &self.right_of) {
+            let path = path.clone();
+            self.previews.request(path.clone(), true, self.filter);
+            self.pending = Some(path);
+        }
     }
 
     pub fn sync_right(&mut self) {

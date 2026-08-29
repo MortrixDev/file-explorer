@@ -3,7 +3,9 @@ use std::{
     ffi::{OsStr, OsString},
     fs, io,
     os::unix::ffi::OsStrExt,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
+    time::SystemTime,
 };
 
 const SCROLLOFF: usize = 3;
@@ -26,19 +28,21 @@ impl Listing {
                 continue;
             };
             let name = entry.file_name();
-            let kind = if file_type.is_symlink() {
-                match fs::metadata(dir.join(&name)) {
-                    Ok(target) => kind_of(target.file_type()),
-                    Err(_) => Kind::Other,
-                }
+            let found = if file_type.is_symlink() {
+                fs::metadata(dir.join(&name)).ok()
             } else {
-                kind_of(file_type)
+                entry.metadata().ok()
             };
-            all.push(Entry {
-                name,
-                kind,
-                meta: None,
+            let kind = match &found {
+                Some(meta) => kind_of(meta.file_type()),
+                None => kind_of(file_type),
+            };
+            let meta = found.map(|meta| Meta {
+                size: meta.len(),
+                modified: meta.modified().ok(),
+                mode: meta.permissions().mode(),
             });
+            all.push(Entry { name, kind, meta });
         }
 
         let mut listing = Listing {
@@ -227,6 +231,21 @@ impl Entry {
         self.kind == Kind::File
     }
 
+    pub fn is_exec(&self) -> bool {
+        self.is_file() && self.meta.as_ref().is_some_and(|m| m.mode & 0o111 != 0)
+    }
+
+    pub fn size(&self) -> Option<u64> {
+        match self.is_dir() {
+            true => None,
+            false => self.meta.as_ref().map(|m| m.size),
+        }
+    }
+
+    pub fn modified(&self) -> Option<SystemTime> {
+        self.meta.as_ref().and_then(|m| m.modified)
+    }
+
     pub fn is_hidden(&self) -> bool {
         self.name.as_bytes().starts_with(b".")
     }
@@ -253,4 +272,8 @@ pub enum Kind {
     Other,
 }
 
-pub struct Meta {}
+pub struct Meta {
+    pub size: u64,
+    pub modified: Option<SystemTime>,
+    pub mode: u32,
+}

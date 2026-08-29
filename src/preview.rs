@@ -12,6 +12,7 @@ pub enum Preview {
     Text { lines: Vec<String>, truncated: bool },
     Binary { size: u64 },
     Image { width: u32, height: u32 },
+    Pdf { size: u64 },
 }
 
 pub fn load(path: &Path) -> io::Result<Preview> {
@@ -21,6 +22,10 @@ pub fn load(path: &Path) -> io::Result<Preview> {
     let clipped = size > BYTE_LIMIT;
     let mut bytes = Vec::new();
     file.by_ref().take(HEAD).read_to_end(&mut bytes)?;
+
+    if bytes.starts_with(b"%PDF-") {
+        return Ok(Preview::Pdf { size });
+    }
 
     if image::guess_format(&bytes).is_ok()
         && let Ok((width, height)) = image::image_dimensions(path)

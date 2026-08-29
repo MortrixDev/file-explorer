@@ -1,5 +1,15 @@
+use std::time::SystemTime;
+
+use jiff::{Timestamp, tz::TimeZone};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
+use unicode_width::UnicodeWidthChar;
+use unicode_width::UnicodeWidthStr;
+
+const SIZE_W: usize = 6;
+const DATE_W: usize = 16;
+const MIN_NAME: usize = 12;
+const GAP: usize = 3;
 
 use crate::listing::Listing;
 use crate::preview::Preview;
@@ -80,35 +90,152 @@ fn entry_lines(
     width: u16,
     stripe: Option<Color>,
 ) -> Vec<Line<'static>> {
+    let cols = columns_for(width);
     rows(listing, height)
         .map(|(row, entry)| {
-            let mut style = Style::default();
-            if entry.is_dir() {
-                style = style.fg(Color::Blue).add_modifier(Modifier::BOLD);
-            }
-            if entry.is_hidden() {
-                style = style.add_modifier(Modifier::DIM);
-            }
-            if Some(row) == cursor {
-                style = style.add_modifier(Modifier::REVERSED);
+            let on_cursor = Some(row) == cursor;
+
+            let mut row_style = Style::default();
+            if on_cursor {
+                row_style = row_style.add_modifier(Modifier::REVERSED);
             } else if row % 2 == 1
                 && let Some(color) = stripe
             {
-                style = style.bg(color);
+                row_style = row_style.bg(color);
             }
+
+            let mut name_style = Style::default();
+            if entry.is_dir() {
+                name_style = name_style.fg(Color::Blue).add_modifier(Modifier::BOLD);
+            }
+            if entry.is_exec() {
+                name_style = name_style.fg(Color::Green);
+            }
+            if entry.is_hidden() {
+                name_style = name_style.add_modifier(Modifier::DIM);
+            }
+
+            let mut meta_style = Style::default();
+            if on_cursor {
+                if let Some(fg) = name_style.fg {
+                    meta_style = meta_style.fg(fg);
+                }
+            } else {
+                meta_style = meta_style.add_modifier(Modifier::DIM);
+            }
+
             let suffix = if entry.is_dir() { "/" } else { "" };
-            Line::styled(
-                pad(format!(" {}{suffix}", sanitize(&entry.display())), width),
-                style,
-            )
+            let name = format!("{}{suffix}", sanitize(&entry.display()));
+            let (name_cell, meta_cell) = columns(&name, entry, &cols, width);
+
+            Line::from(vec![
+                Span::styled(name_cell, name_style),
+                Span::styled(meta_cell, meta_style),
+            ])
+            .style(row_style)
         })
         .collect()
 }
 
-fn pad(text: String, width: u16) -> String {
-    let filled = Line::raw(text.as_str()).width();
+struct Columns {
+    name: usize,
+    size: bool,
+    date: bool,
+}
+
+fn columns_for(width: u16) -> Columns {
+    let width = width as usize;
+    let size_cost = GAP + SIZE_W;
+    let date_cost = GAP + DATE_W;
+    let fixed = 1 + 1;
+
+    if width >= fixed + MIN_NAME + size_cost + date_cost {
+        Columns {
+            name: width - (fixed + size_cost + date_cost),
+            size: true,
+            date: true,
+        }
+    } else if width >= fixed + MIN_NAME + size_cost {
+        Columns {
+            name: width - (fixed + size_cost),
+            size: true,
+            date: false,
+        }
+    } else {
+        Columns {
+            name: width.saturating_sub(1),
+            size: false,
+            date: false,
+        }
+    }
+}
+
+fn columns(
+    name: &str,
+    entry: &crate::listing::Entry,
+    cols: &Columns,
+    width: u16,
+) -> (String, String) {
+    let name_cell = format!(" {:<width$}", clip(name, cols.name), width = cols.name);
+
+    let mut meta = String::new();
+    if cols.size {
+        let text = entry.size().map_or_else(String::new, human);
+        meta.push_str(&format!("{blank:GAP$}{text:>SIZE_W$}", blank = ""));
+    }
+    if cols.date {
+        let text = entry.modified().map_or_else(String::new, stamp);
+        meta.push_str(&format!("{blank:GAP$}{text:>DATE_W$}", blank = ""));
+    }
+
+    let filled = name_cell.width() + meta.width();
     let gap = (width as usize).saturating_sub(filled);
-    format!("{text}{blank:gap$}", blank = "")
+    (name_cell, format!("{meta}{blank:gap$}", blank = ""))
+}
+
+fn human(size: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "K", "M", "G", "T"];
+    let mut value = size as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{size}B")
+    } else if value < 10.0 {
+        format!("{value:.1}{}", UNITS[unit])
+    } else {
+        format!("{value:.0}{}", UNITS[unit])
+    }
+}
+
+fn stamp(time: SystemTime) -> String {
+    let Ok(moment) = Timestamp::try_from(time) else {
+        return String::new();
+    };
+    moment
+        .to_zoned(TimeZone::system())
+        .strftime("%Y-%m-%d %H:%M")
+        .to_string()
+}
+
+fn clip(text: &str, width: usize) -> String {
+    if text.width() <= width {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let w = ch.width().unwrap_or(0);
+        if used + w > width.saturating_sub(1) {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out.push('…');
+    out
 }
 
 fn draw_right(frame: &mut Frame, state: &State, area: Rect) {
@@ -136,6 +263,13 @@ fn draw_right(frame: &mut Frame, state: &State, area: Rect) {
         }
         Content::File(Preview::Binary { size }) => {
             frame.render_widget(dim(&format!("  binary, {size} bytes")), inner)
+        }
+        Content::File(Preview::Pdf { size }) => {
+            if !state.graphics {
+                frame.render_widget(dim(&format!("  pdf, {size} bytes")), inner)
+            } else if state.loading {
+                frame.render_widget(dim("  rendering…"), inner)
+            }
         }
         Content::File(Preview::Image { width, height }) => {
             if !state.graphics {
