@@ -25,9 +25,18 @@ impl Listing {
             let Ok(file_type) = entry.file_type() else {
                 continue;
             };
+            let name = entry.file_name();
+            let kind = if file_type.is_symlink() {
+                match fs::metadata(dir.join(&name)) {
+                    Ok(target) => kind_of(target.file_type()),
+                    Err(_) => Kind::Other,
+                }
+            } else {
+                kind_of(file_type)
+            };
             all.push(Entry {
-                name: entry.file_name(),
-                kind: kind_of(file_type),
+                name,
+                kind,
                 meta: None,
             });
         }
@@ -88,6 +97,10 @@ impl Listing {
         self.view.iter().map(|&i| &self.all[i])
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.view.is_empty()
+    }
+
     pub fn len(&self) -> usize {
         self.view.len()
     }
@@ -130,6 +143,7 @@ impl Listing {
         if hi >= self.top + height {
             self.top = hi + 1 - height;
         }
+        self.top = self.top.min(self.view.len().saturating_sub(height));
     }
 
     pub fn focus(&mut self, name: &OsStr) -> bool {
@@ -143,7 +157,10 @@ impl Listing {
     }
 
     fn index_of(&self, name: &OsStr) -> Option<usize> {
-        self.view.iter().copied().find(|&i| self.all[i].name == name)
+        self.view
+            .iter()
+            .copied()
+            .find(|&i| self.all[i].name == name)
     }
 
     pub fn path_of(&self, e: &Entry) -> PathBuf {
@@ -188,6 +205,7 @@ fn strip_zeros(s: &[u8]) -> &[u8] {
     s.iter().position(|&c| c != b'0').map_or(&[], |p| &s[p..])
 }
 
+#[derive(Clone, Copy)]
 pub struct Filter {
     pub show_hidden: bool,
     pub dirs_first: bool,

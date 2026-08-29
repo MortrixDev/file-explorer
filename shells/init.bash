@@ -5,5 +5,7 @@ fex() {
   local dir
   dir="$(cat -- "$tmp")"
   rm -f -- "$tmp"
-  [ -n "$dir" ] && [ -d "$dir" ] && cd -- "$dir"
+  if [ -n "$dir" ] && [ -d "$dir" ]; then
+    cd -- "$dir"
+  fi
 }

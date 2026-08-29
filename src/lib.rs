@@ -1,5 +1,9 @@
+pub mod app;
+pub mod cli;
 pub mod kitty;
 pub mod listing;
 pub mod preview;
 pub mod state;
+pub mod term;
+pub mod theme;
 pub mod tui;

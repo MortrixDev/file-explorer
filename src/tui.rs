@@ -5,7 +5,9 @@ use crate::listing::Listing;
 use crate::preview::Preview;
 use crate::state::{Content, State};
 
-const HIDDEN: Color = Color::Indexed(245);
+fn stripe_color(stripe: Option<crate::theme::Rgb>) -> Option<Color> {
+    stripe.map(|(r, g, b)| Color::Rgb(r, g, b))
+}
 
 pub struct Panes {
     pub left: Rect,
@@ -56,7 +58,13 @@ fn draw_listing(frame: &mut Frame, state: &State, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let lines = entry_lines(&state.left, inner.height as usize, state.left.cursor_row());
+    let lines = entry_lines(
+        &state.left,
+        inner.height as usize,
+        state.left.cursor_row(),
+        inner.width,
+        stripe_color(state.stripe),
+    );
 
     if lines.is_empty() {
         frame.render_widget(dim("  (empty)"), inner);
@@ -65,7 +73,13 @@ fn draw_listing(frame: &mut Frame, state: &State, area: Rect) {
     }
 }
 
-fn entry_lines(listing: &Listing, height: usize, cursor: Option<usize>) -> Vec<Line<'static>> {
+fn entry_lines(
+    listing: &Listing,
+    height: usize,
+    cursor: Option<usize>,
+    width: u16,
+    stripe: Option<Color>,
+) -> Vec<Line<'static>> {
     rows(listing, height)
         .map(|(row, entry)| {
             let mut style = Style::default();
@@ -73,15 +87,28 @@ fn entry_lines(listing: &Listing, height: usize, cursor: Option<usize>) -> Vec<L
                 style = style.fg(Color::Blue).add_modifier(Modifier::BOLD);
             }
             if entry.is_hidden() {
-                style = style.fg(HIDDEN);
+                style = style.add_modifier(Modifier::DIM);
             }
             if Some(row) == cursor {
-                style = style.bg(Color::DarkGray);
+                style = style.add_modifier(Modifier::REVERSED);
+            } else if row % 2 == 1
+                && let Some(color) = stripe
+            {
+                style = style.bg(color);
             }
             let suffix = if entry.is_dir() { "/" } else { "" };
-            Line::styled(format!(" {}{suffix}", sanitize(&entry.display())), style)
+            Line::styled(
+                pad(format!(" {}{suffix}", sanitize(&entry.display())), width),
+                style,
+            )
         })
         .collect()
+}
+
+fn pad(text: String, width: u16) -> String {
+    let filled = Line::raw(text.as_str()).width();
+    let gap = (width as usize).saturating_sub(filled);
+    format!("{text}{blank:gap$}", blank = "")
 }
 
 fn draw_right(frame: &mut Frame, state: &State, area: Rect) {
@@ -124,14 +151,14 @@ fn draw_right(frame: &mut Frame, state: &State, area: Rect) {
             )),
             inner,
         ),
-        Content::Dir(listing) => draw_dir(frame, listing, inner),
+        Content::Dir(listing) => draw_dir(frame, listing, inner, stripe_color(state.stripe)),
         Content::Idle => frame.render_widget(dim("  no preview"), inner),
     }
 }
 
-fn draw_dir(frame: &mut Frame, listing: &Listing, area: Rect) {
+fn draw_dir(frame: &mut Frame, listing: &Listing, area: Rect, stripe: Option<Color>) {
     let height = area.height as usize;
-    let mut lines = entry_lines(listing, height, None);
+    let mut lines = entry_lines(listing, height, None, area.width, stripe);
 
     if lines.is_empty() {
         frame.render_widget(dim("  (empty)"), area);
@@ -171,7 +198,7 @@ fn heading(title: String) -> Line<'static> {
 }
 
 fn ellipsis() -> Line<'static> {
-    Line::styled("…", Style::default().fg(Color::DarkGray))
+    Line::styled("…", Style::default().add_modifier(Modifier::DIM))
 }
 
 fn draw_status(frame: &mut Frame, state: &State, area: Rect) {
@@ -192,15 +219,8 @@ fn draw_status(frame: &mut Frame, state: &State, area: Rect) {
     frame.render_widget(dim(&format!(" {position}{hidden}")), area);
 }
 
-fn rows(
-    listing: &Listing,
-    height: usize,
-) -> impl Iterator<Item = (usize, &crate::listing::Entry)> {
-    listing
-        .entries()
-        .enumerate()
-        .skip(listing.top)
-        .take(height)
+fn rows(listing: &Listing, height: usize) -> impl Iterator<Item = (usize, &crate::listing::Entry)> {
+    listing.entries().enumerate().skip(listing.top).take(height)
 }
 
 fn sanitize(s: &str) -> String {
@@ -212,6 +232,6 @@ fn sanitize(s: &str) -> String {
 fn dim(s: &str) -> Paragraph<'static> {
     Paragraph::new(Line::styled(
         s.to_string(),
-        Style::default().fg(Color::DarkGray),
+        Style::default().add_modifier(Modifier::DIM),
     ))
 }

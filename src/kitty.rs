@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -11,6 +10,7 @@ use base64::Engine;
 const CHUNK: usize = 4096;
 const ID: u32 = 1;
 const CACHE: usize = 32;
+const UPSCALE_SHARP: u32 = 2;
 
 pub type Key = (PathBuf, u32, u32);
 
@@ -23,7 +23,7 @@ pub struct Loader {
     done: Receiver<(Key, Option<io::Result<Image>>)>,
     cache: HashMap<Key, Rc<io::Result<Image>>>,
     order: VecDeque<Key>,
-    inflight: usize,
+    inflight: HashSet<Key>,
 }
 
 impl Loader {
@@ -56,21 +56,30 @@ impl Loader {
             done,
             cache: HashMap::new(),
             order: VecDeque::new(),
-            inflight: 0,
+            inflight: HashSet::new(),
         }
     }
 
     pub fn busy(&self) -> bool {
-        self.inflight > 0
+        !self.inflight.is_empty()
     }
 
     pub fn poll(&mut self) -> bool {
         let mut arrived = false;
-        while let Ok((key, image)) = self.done.try_recv() {
-            self.inflight = self.inflight.saturating_sub(1);
-            arrived = true;
-            if let Some(image) = image {
-                self.insert(key, image);
+        loop {
+            match self.done.try_recv() {
+                Ok((key, image)) => {
+                    self.inflight.remove(&key);
+                    arrived = true;
+                    if let Some(image) = image {
+                        self.insert(key, image);
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.inflight.clear();
+                    break;
+                }
             }
         }
         arrived
@@ -80,8 +89,8 @@ impl Loader {
         if let Some(hit) = self.cache.get(key) {
             return Some(Rc::clone(hit));
         }
-        if self.jobs.send(key.clone()).is_ok() {
-            self.inflight += 1;
+        if !self.inflight.contains(key) && self.jobs.send(key.clone()).is_ok() {
+            self.inflight.insert(key.clone());
         }
         None
     }
@@ -109,11 +118,7 @@ impl Default for Loader {
 fn render(key: &Key) -> io::Result<Image> {
     let (path, max_w, max_h) = key;
     let image = image::open(path).map_err(io::Error::other)?;
-    let image = if image.width() > *max_w || image.height() > *max_h {
-        image.thumbnail(*max_w, *max_h)
-    } else {
-        image
-    };
+    let image = fit(image, *max_w, *max_h);
 
     let mut png = io::Cursor::new(Vec::new());
     image
@@ -122,6 +127,47 @@ fn render(key: &Key) -> io::Result<Image> {
     Ok(Image {
         png: png.into_inner(),
     })
+}
+
+fn fit(image: image::DynamicImage, max_w: u32, max_h: u32) -> image::DynamicImage {
+    let (w, h) = (image.width(), image.height());
+    if w == 0 || h == 0 {
+        return image;
+    }
+    if w > max_w || h > max_h {
+        return image.thumbnail(max_w, max_h);
+    }
+    let factor = (max_w / w).min(max_h / h);
+    if factor >= UPSCALE_SHARP {
+        return upscale(&image, factor);
+    }
+    image.resize(max_w, max_h, image::imageops::FilterType::Triangle)
+}
+
+fn upscale(image: &image::DynamicImage, factor: u32) -> image::DynamicImage {
+    let src = image.to_rgba8();
+    let (w, h) = (src.width() as usize, src.height() as usize);
+    let f = factor as usize;
+    let stride = w * f * 4;
+
+    let mut out = Vec::with_capacity(stride * h * f);
+    for y in 0..h {
+        let start = out.len();
+        for x in 0..w {
+            let px = &src.as_raw()[(y * w + x) * 4..(y * w + x) * 4 + 4];
+            for _ in 0..f {
+                out.extend_from_slice(px);
+            }
+        }
+        for _ in 1..f {
+            out.extend_from_within(start..start + stride);
+        }
+    }
+
+    match image::RgbaImage::from_raw((w * f) as u32, (h * f) as u32, out) {
+        Some(scaled) => image::DynamicImage::ImageRgba8(scaled),
+        None => image.clone(),
+    }
 }
 
 pub struct CellSize {

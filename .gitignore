@@ -4,6 +4,7 @@
 /target/
 
 !/.gitignore
+!/LICENSE
 !/Cargo.toml
 !/Cargo.lock
 !/flake.nix
