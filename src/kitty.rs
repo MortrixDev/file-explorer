@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -14,22 +15,29 @@ use hayro::{RenderCache, RenderSettings, render as render_page};
 
 const MIN_SCALE: f32 = 0.01;
 const CHUNK: usize = 4096;
-const ID: u32 = 1;
 const CACHE: usize = 32;
+const ID_LIMIT: u32 = 1024;
 const UPSCALE_SHARP: u32 = 2;
 
 pub type Key = (PathBuf, u32, u32);
 
 pub struct Image {
-    png: Vec<u8>,
+    payload: String,
+}
+
+pub struct Entry {
+    pub result: io::Result<Image>,
+    id: u32,
+    sent: Cell<bool>,
 }
 
 pub struct Loader {
     jobs: Sender<Key>,
     done: Receiver<(Key, Option<io::Result<Image>>)>,
-    cache: HashMap<Key, Rc<io::Result<Image>>>,
+    cache: HashMap<Key, Rc<Entry>>,
     order: VecDeque<Key>,
     inflight: HashSet<Key>,
+    next_id: u32,
 }
 
 impl Loader {
@@ -63,6 +71,7 @@ impl Loader {
             cache: HashMap::new(),
             order: VecDeque::new(),
             inflight: HashSet::new(),
+            next_id: 1,
         }
     }
 
@@ -91,7 +100,7 @@ impl Loader {
         arrived
     }
 
-    pub fn get(&mut self, key: &Key) -> Option<Rc<io::Result<Image>>> {
+    pub fn get(&mut self, key: &Key) -> Option<Rc<Entry>> {
         if let Some(hit) = self.cache.get(key) {
             return Some(Rc::clone(hit));
         }
@@ -105,11 +114,25 @@ impl Loader {
         if self.cache.contains_key(&key) {
             return;
         }
-        self.cache.insert(key.clone(), Rc::new(image));
+
+        let entry = Entry {
+            result: image,
+            id: self.next_id,
+            sent: Cell::new(false),
+        };
+        self.next_id = self.next_id % ID_LIMIT + 1;
+
+        self.cache.insert(key.clone(), Rc::new(entry));
         self.order.push_back(key);
+
         while self.order.len() > CACHE {
-            if let Some(old) = self.order.pop_front() {
-                self.cache.remove(&old);
+            let Some(old) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(entry) = self.cache.remove(&old)
+                && entry.sent.get()
+            {
+                let _ = forget(&mut io::stdout(), entry.id);
             }
         }
     }
@@ -130,8 +153,9 @@ fn render(key: &Key) -> io::Result<Image> {
     image
         .write_to(&mut png, image::ImageFormat::Png)
         .map_err(io::Error::other)?;
+
     Ok(Image {
-        png: png.into_inner(),
+        payload: base64::engine::general_purpose::STANDARD.encode(png.into_inner()),
     })
 }
 
@@ -257,19 +281,27 @@ pub fn cell_size() -> Option<CellSize> {
     })
 }
 
-pub fn place(out: &mut impl Write, image: &Image, x: u16, y: u16) -> io::Result<()> {
+pub fn place(out: &mut impl Write, entry: &Entry, x: u16, y: u16) -> io::Result<()> {
     if !supported() {
         return Ok(());
     }
-    let payload = base64::engine::general_purpose::STANDARD.encode(&image.png);
+    let Ok(image) = &entry.result else {
+        return Ok(());
+    };
 
     write!(out, "\x1b[{};{}H", y + 1, x + 1)?;
-    let mut chunks = payload.as_bytes().chunks(CHUNK).peekable();
+
+    if entry.sent.get() {
+        write!(out, "\x1b_Ga=p,i={},q=2,C=1\x1b\\", entry.id)?;
+        return out.flush();
+    }
+
+    let mut chunks = image.payload.as_bytes().chunks(CHUNK).peekable();
     let mut first = true;
     while let Some(chunk) = chunks.next() {
         let more = u8::from(chunks.peek().is_some());
         if first {
-            write!(out, "\x1b_Ga=T,f=100,i={ID},q=2,C=1,m={more};")?;
+            write!(out, "\x1b_Ga=T,f=100,i={},q=2,C=1,m={more};", entry.id)?;
             first = false;
         } else {
             write!(out, "\x1b_Gm={more};")?;
@@ -277,6 +309,8 @@ pub fn place(out: &mut impl Write, image: &Image, x: u16, y: u16) -> io::Result<
         out.write_all(chunk)?;
         out.write_all(b"\x1b\\")?;
     }
+
+    entry.sent.set(true);
     out.flush()
 }
 
@@ -284,6 +318,22 @@ pub fn clear(out: &mut impl Write) -> io::Result<()> {
     if !supported() {
         return Ok(());
     }
-    write!(out, "\x1b_Ga=d,d=I,i={ID},q=2\x1b\\")?;
+    write!(out, "\x1b_Ga=d,d=a,q=2\x1b\\")?;
+    out.flush()
+}
+
+pub fn clear_all(out: &mut impl Write) -> io::Result<()> {
+    if !supported() {
+        return Ok(());
+    }
+    write!(out, "\x1b_Ga=d,d=A,q=2\x1b\\")?;
+    out.flush()
+}
+
+fn forget(out: &mut impl Write, id: u32) -> io::Result<()> {
+    if !supported() {
+        return Ok(());
+    }
+    write!(out, "\x1b_Ga=d,d=I,i={id},q=2\x1b\\")?;
     out.flush()
 }

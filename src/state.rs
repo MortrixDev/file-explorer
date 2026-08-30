@@ -1,10 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 
+use crate::edit::Edit;
 use crate::kitty;
 use crate::listing::{Filter, Listing};
 use crate::preview::{self, Preview};
@@ -17,11 +18,13 @@ pub struct State {
     pub right_of: Option<PathBuf>,
     pub filter: Filter,
     pub memory: HashMap<PathBuf, OsString>,
-    pub error: Option<String>,
+    pub message: Option<Message>,
     pub graphics: bool,
     pub loading: bool,
     pub stripe: Option<theme::Rgb>,
     pub pending: Option<PathBuf>,
+    pub marks: BTreeSet<PathBuf>,
+    pub mode: Mode,
     previews: Previews,
 }
 
@@ -40,11 +43,13 @@ impl State {
             right_of: None,
             filter,
             memory: HashMap::new(),
-            error: None,
+            message: None,
             graphics: kitty::supported(),
             loading: false,
             stripe: None,
             pending: None,
+            marks: BTreeSet::new(),
+            mode: Mode::Normal,
             previews: Previews::new(),
         })
     }
@@ -64,6 +69,75 @@ impl State {
         }
     }
 
+    pub fn selected_path(&self) -> Option<PathBuf> {
+        self.left.selected().map(|entry| self.left.path_of(entry))
+    }
+
+    pub fn say(&mut self, text: impl Into<String>) {
+        self.message = Some(Message {
+            text: text.into(),
+            error: false,
+        });
+    }
+
+    pub fn fail(&mut self, text: impl Into<String>) {
+        self.message = Some(Message {
+            text: text.into(),
+            error: true,
+        });
+    }
+
+    pub fn rekey(&mut self, old: &Path, new: &Path) {
+        let moved: Vec<PathBuf> = self
+            .memory
+            .keys()
+            .filter(|key| key.starts_with(old))
+            .cloned()
+            .collect();
+
+        for key in moved {
+            let Ok(rest) = key.strip_prefix(old) else {
+                continue;
+            };
+            let target = new.join(rest);
+            if let Some(name) = self.memory.remove(&key) {
+                self.memory.insert(target, name);
+            }
+        }
+    }
+
+    pub fn toggle_mark(&mut self) {
+        let Some(path) = self.selected_path() else {
+            return;
+        };
+        if !self.marks.remove(&path) {
+            self.marks.insert(path);
+        }
+    }
+
+    pub fn reload(&mut self, focus: Option<OsString>) {
+        self.remember();
+        if let Some(name) = focus {
+            self.memory.insert(self.cwd.clone(), name);
+        }
+
+        let mut listing = match Listing::load(&self.cwd, &self.filter) {
+            Ok(listing) => listing,
+            Err(e) => {
+                self.fail(format!("{}: {e}", self.cwd.display()));
+                return;
+            }
+        };
+        if let Some(name) = self.memory.get(&self.cwd) {
+            listing.focus(name);
+        }
+
+        self.left = listing;
+        self.right = Content::Idle;
+        self.right_of = None;
+        self.pending = None;
+    }
+
     pub fn leave(&mut self) {
         let Some(parent) = self.cwd.parent().map(Path::to_path_buf) else {
             return;
@@ -80,7 +154,7 @@ impl State {
         let mut listing = match Listing::load(&dir, &self.filter) {
             Ok(listing) => listing,
             Err(e) => {
-                self.error = Some(format!("{}: {e}", dir.display()));
+                self.fail(format!("{}: {e}", dir.display()));
                 return false;
             }
         };
@@ -91,7 +165,7 @@ impl State {
         }
         self.cwd = dir;
         self.left = listing;
-        self.error = None;
+        self.message = None;
         true
     }
 
@@ -121,8 +195,6 @@ impl State {
         if target == self.right_of || target == self.pending {
             return;
         }
-        self.error = None;
-
         match target {
             None => {
                 self.right = Content::Idle;
@@ -149,6 +221,16 @@ impl State {
     pub fn busy(&self) -> bool {
         self.pending.is_some()
     }
+}
+
+pub struct Message {
+    pub text: String,
+    pub error: bool,
+}
+
+pub enum Mode {
+    Normal,
+    Rename { edit: Edit },
 }
 
 pub enum Content {

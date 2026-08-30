@@ -1,7 +1,11 @@
 pub mod app;
 pub mod cli;
+pub mod commands;
+pub mod edit;
+pub mod highlight;
 pub mod kitty;
 pub mod listing;
+pub mod ops;
 pub mod preview;
 pub mod state;
 pub mod term;

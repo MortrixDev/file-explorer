@@ -2,6 +2,8 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
+use crate::highlight::{self, Piece};
+
 const BYTE_LIMIT: u64 = 128 * 1024;
 const HEAD: u64 = 64;
 const LINE_LIMIT: usize = 2000;
@@ -9,10 +11,20 @@ const COL_LIMIT: usize = 1000;
 const TAB: &str = "    ";
 
 pub enum Preview {
-    Text { lines: Vec<String>, truncated: bool },
-    Binary { size: u64 },
-    Image { width: u32, height: u32 },
-    Pdf { size: u64 },
+    Text {
+        lines: Vec<Vec<Piece>>,
+        truncated: bool,
+    },
+    Binary {
+        size: u64,
+    },
+    Image {
+        width: u32,
+        height: u32,
+    },
+    Pdf {
+        size: u64,
+    },
 }
 
 pub fn load(path: &Path) -> io::Result<Preview> {
@@ -49,7 +61,10 @@ pub fn load(path: &Path) -> io::Result<Preview> {
         lines.pop();
     }
 
-    Ok(Preview::Text { lines, truncated })
+    Ok(Preview::Text {
+        lines: highlight::lines(path, &lines),
+        truncated,
+    })
 }
 
 fn tail_is_binary(file: &mut File, size: u64) -> bool {

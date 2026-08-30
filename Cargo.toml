@@ -12,4 +12,14 @@ image = { version = "0.25.10", default-features = false, features = ["png", "jpe
 jiff = "0.2.35"
 libc = "0.2.189"
 ratatui = "0.30.2"
+syntect = { version = "5.3.0", default-features = false, features = ["default-syntaxes", "regex-fancy"] }
 unicode-width = "0.2.2"
+
+[profile.dev.package.syntect]
+opt-level = 3
+
+[profile.dev.package.fancy-regex]
+opt-level = 3
+
+[profile.dev.package.regex-automata]
+opt-level = 3

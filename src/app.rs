@@ -1,20 +1,21 @@
-use std::ffi::OsString;
 use std::io;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::prelude::*;
 
+use crate::commands;
 use crate::kitty;
+use crate::ops::Op;
 use crate::preview::Preview;
-use crate::state::{Content, State};
-use crate::term::{Term, enter_screen, leave};
+use crate::state::{Content, Mode, State};
+use crate::term::{self, Term};
 use crate::theme;
 use crate::tui;
 
 const THEME_INTERVAL: Duration = Duration::from_secs(2);
+const SETTLE: Duration = Duration::from_millis(120);
 
 pub enum Exit {
     Cd,
@@ -24,6 +25,9 @@ pub enum Exit {
 pub fn run(terminal: &mut Term, state: &mut State) -> io::Result<Exit> {
     let mut loader = kitty::Loader::new();
     let mut shown: Option<(PathBuf, Rect)> = None;
+    let mut target: Option<PathBuf> = None;
+    let mut moved = Instant::now();
+    let mut bar = false;
     let mut watch_theme = true;
     let mut checked = Instant::now();
 
@@ -34,12 +38,29 @@ pub fn run(terminal: &mut Term, state: &mut State) -> io::Result<Exit> {
         state.sync_right();
         state.poll_previews();
 
+        let renaming = matches!(state.mode, Mode::Rename { .. });
+        if renaming != bar {
+            term::cursor_shape(renaming);
+            bar = renaming;
+        }
+
         terminal.draw(|frame| tui::draw(frame, state))?;
 
         loader.poll();
-        sync_image(state, &mut loader, &mut shown, tui::preview_area(area));
 
-        let timeout = if loader.busy() || state.busy() {
+        let wanted = image_target(state);
+        if wanted != target {
+            target = wanted;
+            moved = Instant::now();
+        }
+        let settled = target.is_none() || moved.elapsed() >= SETTLE;
+        let want = match (&target, settled) {
+            (Some(path), true) => Some((path.clone(), tui::preview_area(area))),
+            _ => None,
+        };
+        sync_image(state, &mut loader, &mut shown, want);
+
+        let timeout = if loader.busy() || state.busy() || !settled {
             20
         } else {
             250
@@ -61,6 +82,13 @@ pub fn run(terminal: &mut Term, state: &mut State) -> io::Result<Exit> {
             continue;
         }
 
+        if renaming {
+            commands::rename_key(state, key);
+            continue;
+        }
+
+        state.message = None;
+
         let page = tui::list_height(area).saturating_sub(1) as isize;
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(Exit::Cd),
@@ -74,18 +102,37 @@ pub fn run(terminal: &mut Term, state: &mut State) -> io::Result<Exit> {
             KeyCode::Char('.') => state.toggle_hidden(),
             KeyCode::Char('e') => {
                 if let Some(path) = state.selected_file() {
-                    state.error = match open_in_editor(terminal, &path) {
-                        Ok(()) => None,
-                        Err(e) => Some(e.to_string()),
-                    };
+                    if let Err(e) = commands::open_in_editor(terminal, &path) {
+                        state.fail(e.to_string());
+                    }
                     state.right_of = None;
                     shown = None;
                 }
             }
-            KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => state.enter(),
+            KeyCode::Char(' ') => state.toggle_mark(),
+            KeyCode::Char('m') => commands::transfer(state, Op::Move),
+            KeyCode::Char('c') => commands::transfer(state, Op::Copy),
+            KeyCode::Char('r') => commands::start_rename(state),
+            KeyCode::Char('o') => commands::open_selected(state),
+            KeyCode::Enter => match state.selected_file() {
+                Some(_) => commands::open_selected(state),
+                None => state.enter(),
+            },
+            KeyCode::Char('l') | KeyCode::Right => state.enter(),
             KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace => state.leave(),
             _ => {}
         }
+    }
+}
+
+fn image_target(state: &State) -> Option<PathBuf> {
+    match (&state.right, &state.right_of) {
+        (Content::File(Preview::Image { .. } | Preview::Pdf { .. }), Some(path))
+            if state.graphics && !state.busy() =>
+        {
+            Some(path.clone())
+        }
+        _ => None,
     }
 }
 
@@ -93,17 +140,8 @@ fn sync_image(
     state: &mut State,
     loader: &mut kitty::Loader,
     shown: &mut Option<(PathBuf, Rect)>,
-    area: Rect,
+    want: Option<(PathBuf, Rect)>,
 ) {
-    let want = match (&state.right, &state.right_of) {
-        (Content::File(Preview::Image { .. } | Preview::Pdf { .. }), Some(path))
-            if state.graphics && !state.busy() =>
-        {
-            Some((path.clone(), area))
-        }
-        _ => None,
-    };
-
     state.loading = false;
 
     let mut out = io::stdout();
@@ -129,41 +167,18 @@ fn sync_image(
         return;
     }
 
-    let entry = loader.get(&key);
-    match entry.as_deref() {
-        Some(Ok(image)) => {
-            if let Err(e) = kitty::place(&mut out, image, rect.x, rect.y) {
-                state.error = Some(format!("{}: {e}", path.display()));
+    match loader.get(&key) {
+        Some(entry) => {
+            match &entry.result {
+                Ok(_) => {
+                    if let Err(e) = kitty::place(&mut out, &entry, rect.x, rect.y) {
+                        state.fail(format!("{}: {e}", path.display()));
+                    }
+                }
+                Err(e) => state.fail(format!("{}: {e}", path.display())),
             }
             *shown = Some((path, rect));
         }
-        Some(Err(e)) => {
-            state.error = Some(format!("{}: {e}", path.display()));
-            *shown = Some((path, rect));
-        }
         None => state.loading = true,
-    }
-}
-
-fn open_in_editor(terminal: &mut Term, path: &Path) -> io::Result<()> {
-    let editor = std::env::var_os("EDITOR")
-        .or_else(|| std::env::var_os("VISUAL"))
-        .unwrap_or_else(|| OsString::from("hx"));
-
-    leave()?;
-    let status = Command::new(&editor).arg(path).status();
-    enter_screen()?;
-    terminal.clear()?;
-
-    match status {
-        Ok(code) if code.success() => Ok(()),
-        Ok(code) => Err(io::Error::other(format!(
-            "{}: {code}",
-            editor.to_string_lossy()
-        ))),
-        Err(e) => Err(io::Error::new(
-            e.kind(),
-            format!("{}: {e}", editor.to_string_lossy()),
-        )),
     }
 }

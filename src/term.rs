@@ -1,5 +1,9 @@
 use std::io;
 
+use crossterm::cursor::SetCursorStyle;
+use crossterm::event::{
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -17,11 +21,28 @@ pub fn enter() -> io::Result<Term> {
 
 pub fn enter_screen() -> io::Result<()> {
     enable_raw_mode()?;
-    execute!(io::stdout(), EnterAlternateScreen)
+    execute!(io::stdout(), EnterAlternateScreen)?;
+
+    let _ = execute!(
+        io::stdout(),
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    );
+    Ok(())
+}
+
+pub fn cursor_shape(bar: bool) {
+    let style = if bar {
+        SetCursorStyle::BlinkingBar
+    } else {
+        SetCursorStyle::DefaultUserShape
+    };
+    let _ = execute!(io::stdout(), style);
 }
 
 pub fn leave() -> io::Result<()> {
-    let _ = kitty::clear(&mut io::stdout());
+    let _ = kitty::clear_all(&mut io::stdout());
+    cursor_shape(false);
+    let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
     disable_raw_mode()?;
     execute!(io::stdout(), LeaveAlternateScreen)?;
     Ok(())

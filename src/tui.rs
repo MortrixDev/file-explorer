@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+use std::path::PathBuf;
 use std::time::SystemTime;
 
 use jiff::{Timestamp, tz::TimeZone};
@@ -6,33 +8,110 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use unicode_width::UnicodeWidthChar;
 use unicode_width::UnicodeWidthStr;
 
+const MIN_FOR_HINTS: u16 = 10;
+const HINT_GAP: usize = 2;
+
+const HINTS: &[(&str, &str)] = &[
+    ("q", "quit"),
+    ("Space", "mark"),
+    ("r", "rename"),
+    ("m", "move"),
+    ("c", "copy"),
+    ("e", "edit"),
+    ("o", "open"),
+    (".", "hidden"),
+];
+
+const MARK: &str = " ● ";
+const BLANK: &str = "   ";
+const MARK_W: usize = 3;
 const SIZE_W: usize = 6;
 const DATE_W: usize = 16;
 const MIN_NAME: usize = 12;
 const GAP: usize = 3;
 
+use crate::edit::Edit;
+use crate::highlight::{Piece, Tone};
 use crate::listing::Listing;
 use crate::preview::Preview;
-use crate::state::{Content, State};
+use crate::state::{Content, Mode, State};
 
 fn stripe_color(stripe: Option<crate::theme::Rgb>) -> Option<Color> {
     stripe.map(|(r, g, b)| Color::Rgb(r, g, b))
 }
 
+struct Look<'a> {
+    stripe: Option<Color>,
+    marks: &'a BTreeSet<PathBuf>,
+    edit: Option<(usize, &'a Edit)>,
+}
+
+fn look(state: &State) -> Look<'_> {
+    Look {
+        stripe: stripe_color(state.stripe),
+        marks: &state.marks,
+        edit: None,
+    }
+}
+
+fn look_editing(state: &State) -> Look<'_> {
+    let mut look = look(state);
+    if let Mode::Rename { edit } = &state.mode
+        && let Some(row) = state.left.cursor_row()
+    {
+        look.edit = Some((row, edit));
+    }
+    look
+}
+
+struct Rendered {
+    lines: Vec<Line<'static>>,
+    caret: Option<(u16, u16)>,
+}
+
+fn edit_view(edit: &Edit, field: usize) -> (String, usize) {
+    let caret = edit.caret();
+    let scroll = caret.saturating_sub(field.saturating_sub(1));
+    (take_columns(edit.text(), scroll, field), caret - scroll)
+}
+
+fn take_columns(text: &str, from: usize, width: usize) -> String {
+    let mut out = String::new();
+    let mut col = 0;
+    for ch in text.chars() {
+        let w = ch.width().unwrap_or(0);
+        if col + w > from + width {
+            break;
+        }
+        if col >= from {
+            out.push(ch);
+        }
+        col += w;
+    }
+    out
+}
+
 pub struct Panes {
     pub left: Rect,
     pub right: Rect,
+    pub hints: Rect,
     pub status: Rect,
 }
 
 pub fn layout(area: Rect) -> Panes {
-    let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
+    let rows = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(hint_rows(area)),
+        Constraint::Length(1),
+    ])
+    .split(area);
     let cols =
         Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)]).split(rows[0]);
     Panes {
         left: cols[0],
         right: cols[1],
-        status: rows[1],
+        hints: rows[1],
+        status: rows[2],
     }
 }
 
@@ -54,7 +133,67 @@ pub fn draw(frame: &mut Frame, state: &State) {
     let panes = layout(frame.area());
     draw_listing(frame, state, panes.left);
     draw_right(frame, state, panes.right);
+    draw_hints(frame, state, panes.hints);
     draw_status(frame, state, panes.status);
+}
+
+fn draw_hints(frame: &mut Frame, state: &State, area: Rect) {
+    if area.height == 0 {
+        return;
+    }
+
+    let key_style = Style::default().add_modifier(Modifier::REVERSED);
+    let label_style = match stripe_color(state.stripe) {
+        Some(color) => Style::default().bg(color),
+        None => Style::default().add_modifier(Modifier::DIM),
+    };
+
+    let (rows, per_row) = hint_layout(area.width);
+    let mut lines = Vec::new();
+
+    for row in 0..rows {
+        if row > 0 {
+            lines.push(Line::default());
+        }
+
+        let items = HINTS.iter().skip(row * per_row).take(per_row);
+        let mut spans = Vec::new();
+        for (index, (key, label)) in items.enumerate() {
+            if index > 0 {
+                spans.push(Span::raw(" ".repeat(HINT_GAP)));
+            }
+            spans.push(Span::styled(format!(" {key} "), key_style));
+            spans.push(Span::styled(format!(" {label} "), label_style));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    frame.render_widget(Paragraph::new(lines).centered(), area);
+}
+
+fn hint_width((key, label): (&str, &str)) -> usize {
+    key.width() + label.width() + 4
+}
+
+fn hint_row_width(items: &[(&str, &str)]) -> usize {
+    let entries: usize = items.iter().copied().map(hint_width).sum();
+    entries + HINT_GAP * items.len().saturating_sub(1)
+}
+
+fn hint_layout(width: u16) -> (usize, usize) {
+    if hint_row_width(HINTS) <= width as usize {
+        (1, HINTS.len())
+    } else {
+        (2, HINTS.len().div_ceil(2))
+    }
+}
+
+fn hint_rows(area: Rect) -> u16 {
+    if area.height < MIN_FOR_HINTS {
+        return 0;
+    }
+    let rows = hint_layout(area.width).0 as u16;
+    rows * 2 - 1
 }
 
 fn draw_listing(frame: &mut Frame, state: &State, area: Rect) {
@@ -68,18 +207,22 @@ fn draw_listing(frame: &mut Frame, state: &State, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let lines = entry_lines(
+    let rendered = entry_lines(
         &state.left,
         inner.height as usize,
         state.left.cursor_row(),
         inner.width,
-        stripe_color(state.stripe),
+        &look_editing(state),
     );
 
-    if lines.is_empty() {
+    if rendered.lines.is_empty() {
         frame.render_widget(dim("  (empty)"), inner);
     } else {
-        frame.render_widget(Paragraph::new(lines), inner);
+        frame.render_widget(Paragraph::new(rendered.lines), inner);
+    }
+
+    if let Some((x, y)) = rendered.caret {
+        frame.set_cursor_position((inner.x + x, inner.y + y));
     }
 }
 
@@ -88,53 +231,84 @@ fn entry_lines(
     height: usize,
     cursor: Option<usize>,
     width: u16,
-    stripe: Option<Color>,
-) -> Vec<Line<'static>> {
+    look: &Look,
+) -> Rendered {
     let cols = columns_for(width);
-    rows(listing, height)
-        .map(|(row, entry)| {
-            let on_cursor = Some(row) == cursor;
+    let mut lines = Vec::new();
+    let mut caret = None;
 
-            let mut row_style = Style::default();
-            if on_cursor {
-                row_style = row_style.add_modifier(Modifier::REVERSED);
-            } else if row % 2 == 1
-                && let Some(color) = stripe
-            {
-                row_style = row_style.bg(color);
-            }
+    for (row, entry) in rows(listing, height) {
+        let on_cursor = Some(row) == cursor;
+        let editing = look.edit.and_then(|(at, edit)| (at == row).then_some(edit));
 
-            let mut name_style = Style::default();
-            if entry.is_dir() {
-                name_style = name_style.fg(Color::Blue).add_modifier(Modifier::BOLD);
-            }
-            if entry.is_exec() {
-                name_style = name_style.fg(Color::Green);
-            }
-            if entry.is_hidden() {
-                name_style = name_style.add_modifier(Modifier::DIM);
-            }
+        let mut row_style = Style::default();
+        if !on_cursor
+            && row % 2 == 1
+            && let Some(color) = look.stripe
+        {
+            row_style = row_style.bg(color);
+        }
 
-            let mut meta_style = Style::default();
-            if on_cursor {
-                if let Some(fg) = name_style.fg {
-                    meta_style = meta_style.fg(fg);
-                }
-            } else {
-                meta_style = meta_style.add_modifier(Modifier::DIM);
+        let mut name_style = Style::default();
+        if entry.is_dir() {
+            name_style = name_style.fg(Color::Blue).add_modifier(Modifier::BOLD);
+        }
+        if entry.is_exec() {
+            name_style = name_style.fg(Color::Green);
+        }
+        if entry.is_hidden() {
+            name_style = name_style.add_modifier(Modifier::DIM);
+        }
+
+        let mut meta_style = Style::default();
+        if editing.is_some() {
+            name_style = name_style.add_modifier(Modifier::UNDERLINED);
+            meta_style = meta_style.add_modifier(Modifier::DIM);
+        } else if on_cursor {
+            if let Some(fg) = name_style.fg {
+                meta_style = meta_style.fg(fg);
             }
+            meta_style = meta_style.add_modifier(Modifier::REVERSED);
+            name_style = name_style.add_modifier(Modifier::REVERSED);
+        } else {
+            meta_style = meta_style.add_modifier(Modifier::DIM);
+        }
 
-            let suffix = if entry.is_dir() { "/" } else { "" };
-            let name = format!("{}{suffix}", sanitize(&entry.display()));
-            let (name_cell, meta_cell) = columns(&name, entry, &cols, width);
+        let marked = look.marks.contains(&listing.path_of(entry));
+        let mark_cell = if marked { MARK } else { BLANK };
+        let mark_style = if on_cursor && editing.is_none() {
+            Style::default()
+                .fg(name_style.fg.unwrap_or(Color::Reset))
+                .bg(Color::Red)
+                .add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default().fg(Color::Red)
+        };
 
+        let name = match editing {
+            Some(edit) => {
+                let (text, col) = edit_view(edit, cols.name);
+                caret = Some(((MARK_W + col) as u16, lines.len() as u16));
+                sanitize(&text)
+            }
+            None => {
+                let suffix = if entry.is_dir() { "/" } else { "" };
+                format!("{}{suffix}", sanitize(&entry.display()))
+            }
+        };
+        let (name_cell, meta_cell) = columns(&name, entry, &cols, width);
+
+        lines.push(
             Line::from(vec![
+                Span::styled(mark_cell, mark_style),
                 Span::styled(name_cell, name_style),
                 Span::styled(meta_cell, meta_style),
             ])
-            .style(row_style)
-        })
-        .collect()
+            .style(row_style),
+        );
+    }
+
+    Rendered { lines, caret }
 }
 
 struct Columns {
@@ -147,7 +321,7 @@ fn columns_for(width: u16) -> Columns {
     let width = width as usize;
     let size_cost = GAP + SIZE_W;
     let date_cost = GAP + DATE_W;
-    let fixed = 1 + 1;
+    let fixed = MARK_W + 1;
 
     if width >= fixed + MIN_NAME + size_cost + date_cost {
         Columns {
@@ -176,7 +350,7 @@ fn columns(
     cols: &Columns,
     width: u16,
 ) -> (String, String) {
-    let name_cell = format!(" {:<width$}", clip(name, cols.name), width = cols.name);
+    let name_cell = format!("{:<width$}", clip(name, cols.name), width = cols.name);
 
     let mut meta = String::new();
     if cols.size {
@@ -188,7 +362,7 @@ fn columns(
         meta.push_str(&format!("{blank:GAP$}{text:>DATE_W$}", blank = ""));
     }
 
-    let filled = name_cell.width() + meta.width();
+    let filled = MARK_W + name_cell.width() + meta.width();
     let gap = (width as usize).saturating_sub(filled);
     (name_cell, format!("{meta}{blank:gap$}", blank = ""))
 }
@@ -224,16 +398,7 @@ fn clip(text: &str, width: usize) -> String {
     if text.width() <= width {
         return text.to_string();
     }
-    let mut out = String::new();
-    let mut used = 0;
-    for ch in text.chars() {
-        let w = ch.width().unwrap_or(0);
-        if used + w > width.saturating_sub(1) {
-            break;
-        }
-        out.push(ch);
-        used += w;
-    }
+    let mut out = take_columns(text, 0, width.saturating_sub(1));
     out.push('…');
     out
 }
@@ -285,14 +450,14 @@ fn draw_right(frame: &mut Frame, state: &State, area: Rect) {
             )),
             inner,
         ),
-        Content::Dir(listing) => draw_dir(frame, listing, inner, stripe_color(state.stripe)),
+        Content::Dir(listing) => draw_dir(frame, listing, inner, &look(state)),
         Content::Idle => frame.render_widget(dim("  no preview"), inner),
     }
 }
 
-fn draw_dir(frame: &mut Frame, listing: &Listing, area: Rect, stripe: Option<Color>) {
+fn draw_dir(frame: &mut Frame, listing: &Listing, area: Rect, look: &Look) {
     let height = area.height as usize;
-    let mut lines = entry_lines(listing, height, None, area.width, stripe);
+    let mut lines = entry_lines(listing, height, None, area.width, look).lines;
 
     if lines.is_empty() {
         frame.render_widget(dim("  (empty)"), area);
@@ -306,7 +471,20 @@ fn draw_dir(frame: &mut Frame, listing: &Listing, area: Rect, stripe: Option<Col
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn draw_text(frame: &mut Frame, lines: &[String], truncated: bool, area: Rect) {
+fn tone_style(tone: Tone) -> Style {
+    match tone {
+        Tone::Plain => Style::default(),
+        Tone::Comment => Style::default().add_modifier(Modifier::DIM),
+        Tone::Quoted => Style::default().fg(Color::Green),
+        Tone::Number => Style::default().fg(Color::Cyan),
+        Tone::Constant => Style::default().fg(Color::Cyan),
+        Tone::Keyword => Style::default().fg(Color::Magenta),
+        Tone::Type => Style::default().fg(Color::Yellow),
+        Tone::Function => Style::default().fg(Color::Blue),
+    }
+}
+
+fn draw_text(frame: &mut Frame, lines: &[Vec<Piece>], truncated: bool, area: Rect) {
     if lines.is_empty() {
         frame.render_widget(dim("  (empty)"), area);
         return;
@@ -316,7 +494,13 @@ fn draw_text(frame: &mut Frame, lines: &[String], truncated: bool, area: Rect) {
     let mut shown: Vec<Line> = lines
         .iter()
         .take(height)
-        .map(|line| Line::raw(sanitize(line)))
+        .map(|pieces| {
+            let spans: Vec<Span> = pieces
+                .iter()
+                .map(|piece| Span::styled(sanitize(&piece.text), tone_style(piece.tone)))
+                .collect();
+            Line::from(spans)
+        })
         .collect();
 
     if (truncated || lines.len() > height) && shown.len() == height {
@@ -336,10 +520,20 @@ fn ellipsis() -> Line<'static> {
 }
 
 fn draw_status(frame: &mut Frame, state: &State, area: Rect) {
-    if let Some(error) = &state.error {
+    if matches!(state.mode, Mode::Rename { .. }) {
+        frame.render_widget(dim(" rename · enter to confirm · esc to cancel"), area);
+        return;
+    }
+
+    if let Some(message) = &state.message {
+        let color = if message.error {
+            Color::Red
+        } else {
+            Color::Green
+        };
         let line = Line::styled(
-            format!(" {}", sanitize(error)),
-            Style::default().fg(Color::Red),
+            format!(" {}", sanitize(&message.text)),
+            Style::default().fg(color),
         );
         frame.render_widget(Paragraph::new(line), area);
         return;
@@ -350,7 +544,11 @@ fn draw_status(frame: &mut Frame, state: &State, area: Rect) {
         None => "0/0".to_string(),
     };
     let hidden = if state.filter.show_hidden { " ." } else { "" };
-    frame.render_widget(dim(&format!(" {position}{hidden}")), area);
+    let marked = match state.marks.len() {
+        0 => String::new(),
+        n => format!(" · {n} marked"),
+    };
+    frame.render_widget(dim(&format!(" {position}{hidden}{marked}")), area);
 }
 
 fn rows(listing: &Listing, height: usize) -> impl Iterator<Item = (usize, &crate::listing::Entry)> {
