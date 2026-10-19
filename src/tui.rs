@@ -199,11 +199,13 @@ fn hint_rows(area: Rect) -> u16 {
 fn draw_listing(frame: &mut Frame, state: &State, area: Rect) {
     let cwd = sanitize(&state.cwd.to_string_lossy());
     let title = if cwd.ends_with('/') {
-        format!(" {cwd} ")
+        cwd
     } else {
-        format!(" {cwd}/ ")
+        format!("{cwd}/")
     };
-    let block = Block::default().borders(Borders::ALL).title(heading(title));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(heading(&title, area));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -350,7 +352,7 @@ fn columns(
     cols: &Columns,
     width: u16,
 ) -> (String, String) {
-    let name_cell = format!("{:<width$}", clip(name, cols.name), width = cols.name);
+    let name_cell = format!("{:<width$}", clip_right(name, cols.name), width = cols.name);
 
     let mut meta = String::new();
     if cols.size {
@@ -394,13 +396,22 @@ fn stamp(time: SystemTime) -> String {
         .to_string()
 }
 
-fn clip(text: &str, width: usize) -> String {
-    if text.width() <= width {
+fn clip_left(text: &str, width: usize) -> String {
+    let total = text.width();
+    if total <= width {
         return text.to_string();
     }
-    let mut out = take_columns(text, 0, width.saturating_sub(1));
-    out.push('…');
-    out
+    let budget = width.saturating_sub(1);
+    format!("…{}", take_columns(text, total - budget, budget))
+}
+
+fn clip_right(text: &str, width: usize) -> String {
+    let total = text.width();
+    if total <= width {
+        return text.to_string();
+    }
+    let budget = width.saturating_sub(1);
+    format!("{}…", take_columns(text, 0, budget))
 }
 
 fn draw_right(frame: &mut Frame, state: &State, area: Rect) {
@@ -418,7 +429,9 @@ fn draw_right(frame: &mut Frame, state: &State, area: Rect) {
         },
         None => String::new(),
     };
-    let block = Block::default().borders(Borders::ALL).title(heading(title));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(heading(&title, area));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -511,8 +524,17 @@ fn draw_text(frame: &mut Frame, lines: &[Vec<Piece>], truncated: bool, area: Rec
     frame.render_widget(Paragraph::new(shown), area);
 }
 
-fn heading(title: String) -> Line<'static> {
-    Line::styled(title, Style::default().fg(Color::Yellow))
+fn heading(text: &str, area: Rect) -> Line<'static> {
+    if text.is_empty() {
+        return Line::default();
+    }
+    Line::styled(
+        format!(
+            " {} ",
+            clip_left(text, area.width.saturating_sub(4) as usize)
+        ),
+        Style::default().fg(Color::Yellow),
+    )
 }
 
 fn ellipsis() -> Line<'static> {
