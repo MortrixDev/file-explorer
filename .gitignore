@@ -4,6 +4,7 @@
 /target/
 
 !/.gitignore
+!/README.md
 !/LICENSE
 !/Cargo.toml
 !/Cargo.lock
